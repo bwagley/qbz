@@ -1473,8 +1473,10 @@ impl QtQconnectService {
                                 if !lan_callback_is_current(
                                     callback_intent.as_ref(),
                                     callback_authority.as_ref(),
-                                    stamp,
                                 ) {
+                                    log::warn!(
+                                        "[QConnect LAN] handoff ignored: Qobuz Connect is not active"
+                                    );
                                     return;
                                 }
                                 match coordinator.admit(candidate).await {

@@ -313,11 +313,8 @@ impl DaemonQconnectService {
         let callback_authority = Arc::clone(&self.authority);
         let runtime_handle = tokio::runtime::Handle::current();
         let callback = Arc::new(move |candidate| {
-            if !lan_callback_is_current(
-                callback_intent.as_ref(),
-                callback_authority.as_ref(),
-                stamp,
-            ) {
+            if !lan_callback_is_current(callback_intent.as_ref(), callback_authority.as_ref()) {
+                log::warn!("[QConnect LAN] handoff ignored: Qobuz Connect is not active");
                 return;
             }
             let result = runtime_handle.block_on(coordinator.admit(candidate));

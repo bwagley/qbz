@@ -5,19 +5,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{AuthorityCell, AuthorityStamp, QconnectEnableIntent};
+use crate::{AuthorityCell, QconnectEnableIntent};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const START_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A listener outlives the one-shot enable epoch that created it, but never
-/// the current enabled intent or the exact authority runtime it projects.
+/// A listener outlives the one-shot enable epoch that created it and the
+/// individual runtimes installed while it runs (owner -> delegated -> restored
+/// owner), but never the enabled intent or an installed authority.
+///
+/// Binding the callback to the stamp current at listener start silently
+/// dropped every handoff after the first delegation, because nothing restarts
+/// the listener when a delegated runtime or a restored owner is installed.
+/// Whether a candidate may replace the installed authority is decided
+/// transactionally by the delegation coordinator.
 pub fn lan_callback_is_current(
     enable_intent: &QconnectEnableIntent,
     authority: &AuthorityCell,
-    stamp: AuthorityStamp,
 ) -> bool {
-    enable_intent.current_token().is_some() && authority.is_current(stamp)
+    enable_intent.current_token().is_some() && authority.current().is_some()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -188,26 +194,36 @@ mod tests {
     use crate::AuthorityOrigin;
 
     #[test]
-    fn callback_survives_intent_refresh_but_not_disable_or_authority_change() {
+    fn callback_survives_intent_refresh_and_handoffs_but_not_disable_or_clear() {
         let intent = QconnectEnableIntent::new(true);
         let original = intent.current_token().unwrap();
         let authority = AuthorityCell::new();
-        let stamp = authority.reserve(AuthorityOrigin::Owner);
-        assert!(authority.install(stamp));
-        assert!(lan_callback_is_current(&intent, &authority, stamp));
+        assert!(!lan_callback_is_current(&intent, &authority));
+        let owner = authority.reserve(AuthorityOrigin::Owner);
+        assert!(authority.install(owner));
+        assert!(lan_callback_is_current(&intent, &authority));
 
         let refreshed = intent.enable_new_intent();
         assert!(!intent.is_current(original));
         assert!(intent.is_current(refreshed));
-        assert!(lan_callback_is_current(&intent, &authority, stamp));
+        assert!(lan_callback_is_current(&intent, &authority));
+
+        // A delegated handoff and the owner restore that follows it both
+        // install new stamps; the listener must keep admitting through them.
+        let delegated = authority.reserve(AuthorityOrigin::Delegated { generation: 1 });
+        assert!(authority.install(delegated));
+        assert!(lan_callback_is_current(&intent, &authority));
+        let restored = authority.reserve(AuthorityOrigin::Owner);
+        assert!(authority.install(restored));
+        assert!(lan_callback_is_current(&intent, &authority));
 
         let disabled = intent.disable();
-        assert!(!lan_callback_is_current(&intent, &authority, stamp));
+        assert!(!lan_callback_is_current(&intent, &authority));
         assert!(intent.enable_if_disabled(disabled).is_some());
-        assert!(lan_callback_is_current(&intent, &authority, stamp));
+        assert!(lan_callback_is_current(&intent, &authority));
 
         authority.clear();
-        assert!(!lan_callback_is_current(&intent, &authority, stamp));
+        assert!(!lan_callback_is_current(&intent, &authority));
     }
 
     #[tokio::test]
