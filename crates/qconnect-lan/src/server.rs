@@ -764,10 +764,13 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn route_for(path: &str) -> LanHttpRoute {
-    match path {
-        "/get-display-info" => LanHttpRoute::GetDisplayInfo,
-        "/get-connect-info" => LanHttpRoute::GetConnectInfo,
-        "/connect-to-qconnect" => LanHttpRoute::ConnectToQconnect,
+    // The official Android client joins "/" + the advertised TXT `path`
+    // (empty) + "/get-display-info", sending `//get-display-info`. Accept
+    // repeated leading slashes; everything else stays an exact match.
+    match path.trim_start_matches('/') {
+        "get-display-info" => LanHttpRoute::GetDisplayInfo,
+        "get-connect-info" => LanHttpRoute::GetConnectInfo,
+        "connect-to-qconnect" => LanHttpRoute::ConnectToQconnect,
         _ => LanHttpRoute::Unknown,
     }
 }
@@ -997,6 +1000,20 @@ mod tests {
         assert!(limiter.allow(ip, now));
         assert!(!limiter.allow(ip, now));
         assert!(limiter.allow(ip, now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn routes_accept_official_double_slash() {
+        assert_eq!(route_for("/get-display-info"), LanHttpRoute::GetDisplayInfo);
+        assert_eq!(route_for("//get-display-info"), LanHttpRoute::GetDisplayInfo);
+        assert_eq!(route_for("//get-connect-info"), LanHttpRoute::GetConnectInfo);
+        assert_eq!(
+            route_for("//connect-to-qconnect"),
+            LanHttpRoute::ConnectToQconnect
+        );
+        assert_eq!(route_for("//get-display-info?alias=1"), LanHttpRoute::Unknown);
+        assert_eq!(route_for("/qconnect/get-display-info"), LanHttpRoute::Unknown);
+        assert_eq!(route_for("/"), LanHttpRoute::Unknown);
     }
 
     #[test]
