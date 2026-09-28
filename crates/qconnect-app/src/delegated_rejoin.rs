@@ -5,11 +5,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use qconnect_protocol::RendererCommandType;
 use qconnect_transport_ws::TransportEvent;
+use tokio::time::Instant;
 
 use crate::{AuthorityCell, AuthorityOrigin, AuthorityStamp};
 
 const DELEGATED_REJOIN_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a delegated renderer stays attached after the controller sends
+/// `SET_ACTIVE {active:false}` without reactivating it.
+pub const DELEGATED_RELEASE_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatedRuntimeEventDirective {
@@ -146,11 +152,92 @@ impl Drop for DelegatedRejoinWatchdog {
     }
 }
 
+/// `Some(active)` for a renderer `SET_ACTIVE` command, `None` otherwise.
+pub fn renderer_activation_edge(event: &TransportEvent) -> Option<bool> {
+    match event {
+        TransportEvent::InboundRendererServerCommand(command)
+            if command.command_type == RendererCommandType::SrvrRndrSetActive =>
+        {
+            command
+                .payload
+                .get("active")
+                .and_then(serde_json::Value::as_bool)
+        }
+        _ => None,
+    }
+}
+
+/// Detects a controller releasing a delegated renderer.
+///
+/// Owner runtimes wait for `ACTIVE_RENDERER_CHANGED` before detaching, but a
+/// delegated runtime joins the guest session as a renderer only and never
+/// receives that topology. Without this, a released delegated runtime stays
+/// installed until its credentials expire.
+#[derive(Debug, Default)]
+pub struct DelegatedReleaseTracker {
+    released_at: Option<Instant>,
+}
+
+impl DelegatedReleaseTracker {
+    pub fn observe(&mut self, event: &TransportEvent, now: Instant) {
+        match renderer_activation_edge(event) {
+            Some(false) if self.released_at.is_none() => self.released_at = Some(now),
+            Some(true) => self.released_at = None,
+            Some(false) | None => {}
+        }
+    }
+
+    /// When the owner should be restored, if the controller has released us.
+    pub fn restore_deadline(&self) -> Option<Instant> {
+        self.released_at
+            .map(|released_at| released_at + DELEGATED_RELEASE_GRACE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use qconnect_protocol::RendererServerCommand;
+
     use super::*;
+
+    fn set_active(active: bool) -> TransportEvent {
+        TransportEvent::InboundRendererServerCommand(RendererServerCommand {
+            command_type: RendererCommandType::SrvrRndrSetActive,
+            payload: serde_json::json!({ "active": active }),
+        })
+    }
+
+    #[test]
+    fn release_tracker_arms_on_deactivation_and_clears_on_reactivation() {
+        let start = Instant::now();
+        let mut tracker = DelegatedReleaseTracker::default();
+        assert_eq!(tracker.restore_deadline(), None);
+
+        tracker.observe(&set_active(true), start);
+        assert_eq!(tracker.restore_deadline(), None);
+
+        tracker.observe(&set_active(false), start);
+        assert_eq!(
+            tracker.restore_deadline(),
+            Some(start + DELEGATED_RELEASE_GRACE)
+        );
+
+        // A repeated release does not extend the grace window.
+        tracker.observe(&set_active(false), start + Duration::from_secs(3));
+        assert_eq!(
+            tracker.restore_deadline(),
+            Some(start + DELEGATED_RELEASE_GRACE)
+        );
+
+        // Unrelated traffic leaves the release armed.
+        tracker.observe(&TransportEvent::KeepalivePongReceived, start);
+        assert!(tracker.restore_deadline().is_some());
+
+        tracker.observe(&set_active(true), start + Duration::from_secs(4));
+        assert_eq!(tracker.restore_deadline(), None);
+    }
 
     #[test]
     fn runtime_event_state_rejoins_only_after_disconnect_and_fails_closed_on_fatal() {

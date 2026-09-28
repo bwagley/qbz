@@ -104,6 +104,10 @@ impl Default for DelegationCoordinatorConfig {
 pub enum RestoreReason {
     CredentialExpired,
     TransportFatal,
+    /// The delegating controller deactivated this renderer and did not
+    /// reactivate it. A delegated runtime has no owner-session topology to
+    /// wait on, so the owner authority must be restored.
+    ControllerReleased,
 }
 
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -1089,7 +1093,10 @@ const fn merge_restore_reason(
         (Some(RestoreReason::TransportFatal), _) | (_, RestoreReason::TransportFatal) => {
             RestoreReason::TransportFatal
         }
-        _ => RestoreReason::CredentialExpired,
+        (Some(RestoreReason::CredentialExpired), _) | (_, RestoreReason::CredentialExpired) => {
+            RestoreReason::CredentialExpired
+        }
+        _ => RestoreReason::ControllerReleased,
     }
 }
 

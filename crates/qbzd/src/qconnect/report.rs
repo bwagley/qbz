@@ -21,7 +21,8 @@ use qbz_player::player::PlaybackBufferState;
 use qconnect_app::{
     build_renderer_playback_report, confirm_local_playback_state_asserted,
     is_local_renderer_active, qconnect_report_track_id, renderer_playing_state,
-    QconnectFileAudioQualitySnapshot, QconnectRemoteSyncState, RendererPlaybackSnapshot,
+    QConnectRendererState, QconnectFileAudioQualitySnapshot, QconnectRemoteSyncState,
+    RendererPlaybackSnapshot,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -61,18 +62,37 @@ pub async fn report_playback_state(
     // Only report when WE are the active renderer. When a peer renderer owns
     // playback (the daemon is acting as a controller) the renderer reports come
     // from the peer, not us.
+    //
+    // A delegated runtime joins the guest session as a renderer only, so it
+    // never learns the session topology `is_local_renderer_active` reads. Its
+    // activation is the controller's SET_ACTIVE, recorded in the renderer state.
+    let delegated = stamp.origin().delegated_generation().is_some();
+    let renderer = app.renderer_state_snapshot().await;
+    if !authority.is_current(stamp) {
+        return;
+    }
     {
         let state = sync_state.lock().await;
         if !authority.is_current(stamp) {
             return;
         }
-        if !is_local_renderer_active(&state.session) {
+        let active = if delegated {
+            renderer.active == Some(true)
+        } else {
+            is_local_renderer_active(&state.session)
+        };
+        if !active {
             return;
         }
     }
 
-    let (current_qid, next_qid) =
+    let (mut current_qid, mut next_qid) =
         resolve_queue_item_ids_by_track_id(app, sync_state, authority, stamp, track_id).await;
+    if current_qid.is_none() && delegated {
+        // The delegated runtime has no cloud queue; the controller names the
+        // current/next queue items in its SET_STATE commands instead.
+        (current_qid, next_qid) = renderer_queue_item_ids(&renderer, track_id);
+    }
     if !authority.is_current(stamp) {
         return;
     }
@@ -233,6 +253,21 @@ async fn resolve_queue_item_ids_by_track_id(
     }
 }
 
+/// Current/next `queue_item_id` for `track_id` from the controller-supplied
+/// renderer state, when that state names the playing track.
+fn renderer_queue_item_ids(
+    renderer: &QConnectRendererState,
+    track_id: u64,
+) -> (Option<u64>, Option<u64>) {
+    match renderer.current_track.as_ref() {
+        Some(current) if current.track_id == track_id => (
+            Some(current.queue_item_id),
+            renderer.next_track.as_ref().map(|next| next.queue_item_id),
+        ),
+        _ => (None, None),
+    }
+}
+
 // T10 (§7.2, §3.1-7): the report-tick scheduler. The desktop reports from its
 // 450 ms Slint poll loop; the daemon has no such loop, so a dedicated tokio task
 // owns the cadence. It calls `report_playback_state` on the LIVE session (a no-op
@@ -337,6 +372,28 @@ mod tests {
         assert_eq!(classify_audio_quality(192_000, 24), AUDIO_QUALITY_HIRES_L2);
         assert_eq!(classify_audio_quality(384_000, 24), AUDIO_QUALITY_HIRES_L3);
         assert_eq!(classify_audio_quality(22_050, 16), AUDIO_QUALITY_MP3);
+    }
+
+    #[test]
+    fn renderer_queue_item_ids_follow_the_controller_named_track() {
+        use qconnect_core::QueueItem;
+
+        let item = |track_id, queue_item_id| QueueItem {
+            track_context_uuid: String::new(),
+            track_id,
+            queue_item_id,
+        };
+        let mut renderer = QConnectRendererState::default();
+        assert_eq!(renderer_queue_item_ids(&renderer, 42), (None, None));
+
+        renderer.current_track = Some(item(42, 8));
+        renderer.next_track = Some(item(43, 9));
+        assert_eq!(renderer_queue_item_ids(&renderer, 42), (Some(8), Some(9)));
+        // A stale renderer cursor must not label a different playing track.
+        assert_eq!(renderer_queue_item_ids(&renderer, 99), (None, None));
+
+        renderer.next_track = None;
+        assert_eq!(renderer_queue_item_ids(&renderer, 42), (Some(8), None));
     }
 
     #[test]

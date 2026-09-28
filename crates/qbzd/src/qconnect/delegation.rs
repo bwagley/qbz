@@ -25,11 +25,11 @@ use qbz_models::{CoreEvent, Quality};
 use qbz_qobuz::{DelegatedApiConfig, DelegatedApiEndpoint, DelegatedQobuzClient, QobuzClient};
 use qconnect_app::{
     acquire_transition_guard_and_fence, max_audio_quality_from_quality, CommitRejected,
-    DeferredActivationRelease, DelegatedRejoinWatchdog, DelegatedRuntimeEventDirective,
-    DelegatedRuntimeEventState, DelegationCancellation, DelegationCoordinator, DelegationErrorCode,
-    DelegationHost, DelegationPreflight, OwnerActionFence, QconnectApp, QconnectAppEvent,
-    QconnectEventSink, QconnectLifecycleState, QconnectRemoteSyncState, QconnectSessionState,
-    RestoreReason, SessionLoopHost,
+    DeferredActivationRelease, DelegatedRejoinWatchdog, DelegatedReleaseTracker,
+    DelegatedRuntimeEventDirective, DelegatedRuntimeEventState, DelegationCancellation,
+    DelegationCoordinator, DelegationErrorCode, DelegationHost, DelegationPreflight,
+    OwnerActionFence, QconnectApp, QconnectAppEvent, QconnectEventSink, QconnectLifecycleState,
+    QconnectRemoteSyncState, QconnectSessionState, RestoreReason, SessionLoopHost,
 };
 use qconnect_lan::{HandoffCandidate, LanProjection};
 use qconnect_transport_ws::{NativeWsTransport, TransportEvent, WsTransportConfig};
@@ -1332,7 +1332,9 @@ async fn run_delegated_loop(
 ) {
     let mut reconnect_state = DelegatedRuntimeEventState::default();
     let mut rejoin_watchdog = DelegatedRejoinWatchdog::new();
+    let mut release = DelegatedReleaseTracker::default();
     for event in buffered {
+        release.observe(&event, tokio::time::Instant::now());
         if !handle_delegated_event(
             &app,
             &sink,
@@ -1355,7 +1357,24 @@ async fn run_delegated_loop(
         }
     }
     loop {
-        let event = match receiver.recv().await {
+        let received = tokio::select! {
+            received = receiver.recv() => received,
+            () = wait_for_deadline(release.restore_deadline()) => {
+                if authority.is_current(stamp) {
+                    log::info!(
+                        "[QConnect] delegated controller released this renderer; restoring owner"
+                    );
+                    request_restore_for(
+                        coordinator.as_ref(),
+                        generation,
+                        RestoreReason::ControllerReleased,
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+        let event = match received {
             Ok(event) => event,
             Err(broadcast::error::RecvError::Lagged(_)) => {
                 request_restore(coordinator.as_ref(), generation).await;
@@ -1366,6 +1385,7 @@ async fn run_delegated_loop(
                 return;
             }
         };
+        release.observe(&event, tokio::time::Instant::now());
         if !handle_delegated_event(
             &app,
             &sink,
@@ -1467,9 +1487,25 @@ async fn handle_delegated_event(
 }
 
 async fn request_restore(coordinator: Option<&DaemonDelegationCoordinator>, generation: u64) {
+    request_restore_for(coordinator, generation, RestoreReason::TransportFatal).await;
+}
+
+async fn request_restore_for(
+    coordinator: Option<&DaemonDelegationCoordinator>,
+    generation: u64,
+    reason: RestoreReason,
+) {
     if let Some(coordinator) = coordinator {
         let _ = coordinator
-            .restore_owner_if_active(generation, RestoreReason::TransportFatal)
+            .restore_owner_if_active(generation, reason)
             .await;
+    }
+}
+
+/// Resolve at `deadline`, or never when no deadline is armed.
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }

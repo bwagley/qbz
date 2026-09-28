@@ -36,7 +36,8 @@ pub use authority_transition::{
     acquire_transition_guard_and_fence, DeferredActivationRelease, OwnerActionFence,
 };
 pub use delegated_rejoin::{
-    DelegatedRejoinWatchdog, DelegatedRuntimeEventDirective, DelegatedRuntimeEventState,
+    renderer_activation_edge, DelegatedRejoinWatchdog, DelegatedReleaseTracker,
+    DelegatedRuntimeEventDirective, DelegatedRuntimeEventState, DELEGATED_RELEASE_GRACE,
 };
 pub use delegation::{
     CommitRejected, CredentialOrigin, DelegationCancellation, DelegationCandidate,
